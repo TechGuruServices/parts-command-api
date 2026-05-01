@@ -1,0 +1,25 @@
+{
+  "name": "parts-command-api",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "test": "vitest",
+    "cf-typegen": "wrangler types"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.12.4",
+    "@types/node": "^25.6.0",
+    "dotenv": "^17.4.2",
+    "drizzle-kit": "^0.31.10",
+    "typescript": "^5.5.2",
+    "vitest": "~3.2.0",
+    "wrangler": "^4.86.0"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
+    "drizzle-orm": "^0.45.2"
+  }
+}
