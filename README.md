@@ -1,3 +1,44 @@
+# ⚙️ PartsCommand CRM API Worker (Cloudflare)
+
+> **2026-09 update.** This repo now contains the **canonical API worker** for the
+> PartsCommand CRM PWA (`zempel-auto-crm`), deployed as the `parts-command-api`
+> Cloudflare Worker. It is kept functionally identical to
+> `zempel-auto-crm/backend/worker.js` — deploying **either** repo yields the same
+> working API. (The Python RockAuto client docs below are retained for the
+> scraper-service side of the project.)
+
+## Routes
+
+| Route | Purpose |
+|---|---|
+| `GET /` / `GET /health` | Status / health |
+| `GET /sync` / `POST /sync` | Full DB pull (ETag/304) / push (upsert + prune deletes) into Neon Postgres JSONB document tables |
+| `GET /prices?partNumber=…` | Parallel competitor price scrape (NAPA, AutoZone, Advance, RockAuto), KV-cached 1h, merged into `retailer_prices` without clobbering your own price/cost |
+| `GET /v1/rockauto/makes…search` | RockAuto catalog. Proxies the Python scraper service (`PYTHON_SERVICE_URL` + `SERVICE_AUTH_KEY` secrets) when configured; otherwise serves a **built-in offline catalog** (makes/years/models/engines/categories + search) so the CRM's RockAuto tab never 404/503s. Live parts/pricing return an honest empty set with a `notice` — prices are never fabricated. |
+| `POST /auth/login` / `POST /auth/logout` | Optional HS256 JWT (Web Crypto; set `JWT_SECRET` to enable) |
+
+## Deploy
+
+```bash
+npm install
+npx wrangler secret put DATABASE_URL       # Neon Postgres connection string
+# optional:
+npx wrangler secret put PYTHON_SERVICE_URL # live RockAuto scraper (rockauto-api-main on Koyeb)
+npx wrangler secret put SERVICE_AUTH_KEY
+npx wrangler deploy
+```
+
+`wrangler.jsonc` already binds the shared `CRM_KV` namespace (rate limiting +
+caches) and the `ALLOWED_ORIGIN` list the PWA runs from.
+
+## Tests
+
+```bash
+npm test   # vitest pool-workers: status routes, offline catalog, sync validation
+```
+
+---
+
 # 🚗 RockAuto API Client
 
 A comprehensive, production-ready Python API client for RockAuto.com - the world's largest online automotive parts catalog.
