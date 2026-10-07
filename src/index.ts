@@ -157,7 +157,6 @@ export default {
 	}
 	if (url.pathname === '/admin/wipe' && request.method === 'POST') {
 		const user = await requireAuth(request, env);
-		const user = await requireAuth(request, env);
 		if (!user || user.role !== 'admin') return json({ error: 'Admin required' }, hdrs, 403);
 		return handleWipe(env, hdrs);
 			}
