@@ -146,8 +146,10 @@ export default {
 				return handleRockAutoProxy(url, request, env, hdrs, ctx, clientIP);
 			}
 			if (url.pathname === '/sync') {
+				const user = await requireAuth(request, env);
+				if (!user) return json({ error: 'Unauthorized' }, hdrs, 401);
 				if (request.method === 'GET') return handleSyncGet(env, request, hdrs);
-				if (request.method === 'POST') return handleSyncPost(request, env, hdrs, clientIP);
+				if (request.method === 'POST') return handleSyncPost(request, env, hdrs, clientIP, user);
 			}
 			if (url.pathname === '/prices' && request.method === 'GET') {
 				return handlePriceLookup(url, env, hdrs, ctx);
@@ -221,7 +223,12 @@ async function jwtVerify(token: string, secret: string): Promise<Record<string, 
 		return null;
 	}
 }
-
+async function requireAuth(request: Request, env: Env): Promise<Record<string, unknown> | null> {
+	if (!env.JWT_SECRET) return null;
+	const authH = request.headers.get('Authorization');
+	if (!authH) return null;
+	return jwtVerify(authH.replace(/^Bearer\s+/i, ''), env.JWT_SECRET);
+}
 // ── Auth ─────────────────────────────────────────────────────
 async function handleLogin(request: Request, env: Env, hdrs: Record<string, string>): Promise<Response> {
 	let body: any;
@@ -357,7 +364,7 @@ function validateSyncPayload(body: any): SyncPayload | null {
 	return out;
 }
 
-async function handleSyncPost(request: Request, env: Env, hdrs: Record<string, string>, clientIP: string): Promise<Response> {
+async function handleSyncPost(request: Request, env: Env, hdrs: Record<string, string>, clientIP: string, user: Record<string, unknown> | null): Promise<Response> {
 	let body: any;
 	try {
 		body = await request.json();
@@ -413,8 +420,8 @@ async function handleSyncPost(request: Request, env: Env, hdrs: Record<string, s
 		const auditEntry = {
 			id: crypto.randomUUID(),
 			action: 'SYNC_PUSH',
-			userId: 'anonymous',
-			role: 'none',
+			userId: (user as any)?.id || 'unknown',
+			role: (user as any)?.role || 'none',
 			ip: clientIP,
 			payload_hash: await sha('SHA-256', JSON.stringify(vb)),
 			timestamp: new Date().toISOString(),
