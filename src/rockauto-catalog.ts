@@ -34,11 +34,12 @@ export async function getMakes(): Promise<{ makes: string[]; count: number }> {
   const html = await raFetch(`${CATALOG_BASE}/`);
   const makes = new Set<string>();
   for (const href of extractHrefs(html)) {
-    if (href.includes('/catalog/') && (href.match(/\//g) || []).length >= 3) {
-      const parts = href.replace(/^\/+|\/+$/g, '').split('/');
-      if (parts.length >= 3 && parts[1] === 'catalog') {
-        const make = parts[2].split(',')[0];
-        if (make && make.length > 1) makes.add(make.toUpperCase());
+    // Make links: /en/catalog/{make} — no commas, no query params, no extra segments
+    const m = href.match(/^\/en\/catalog\/([a-z0-9\-]+)\/?$/i);
+    if (m) {
+      const make = m[1];
+      if (make.length > 1 && !make.includes('?') && !make.includes(',')) {
+        makes.add(make.toUpperCase());
       }
     }
   }
