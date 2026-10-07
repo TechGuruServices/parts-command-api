@@ -154,6 +154,12 @@ export default {
 			}
 			if (url.pathname === '/prices' && request.method === 'GET') {
 				return handlePriceLookup(url, env, hdrs, ctx);
+	}
+	if (url.pathname === '/admin/wipe' && request.method === 'POST') {
+		const user = await requireAuth(request, env);
+		const user = await requireAuth(request, env);
+		if (!user || user.role !== 'admin') return json({ error: 'Admin required' }, hdrs, 403);
+		return handleWipe(env, hdrs);
 			}
 
 			return json({ error: 'Not found', path: url.pathname }, hdrs, 404);
@@ -940,4 +946,13 @@ function parseRockAuto(html: string) {
 		html.match(/<span[^>]*class="[^"]*ra-formatted-amount[^"]*"[^>]*>\$\s*([\d,]+\.[\d]{2})/i) || html.match(/\$\s*([\d,]+\.[\d]{2})/);
 	const nameMatch = html.match(/<td[^>]*class="[^"]*partdesc[^"]*"[^>]*>([^<]+)/i) || html.match(/<span[^>]*class="[^"]*partdesc[^"]*"[^>]*>([^<]+)/i);
 	return { price: priceMatch ? parseFloat(priceMatch[1].replace(',', '')) : null, name: nameMatch ? nameMatch[1].trim() : null };
+}
+
+async function handleWipe(env: Env, hdrs: Record<string, string>): Promise<Response> {
+	const tables = ['inventory', 'customers', 'vehicles', 'sales', 'invoices', 'retailer_prices', 'audit_logs'];
+	for (const t of tables) {
+		try { await query(env, `DELETE FROM ${t}`, []); } catch (e) { }
+	}
+	try { await query(env, `DELETE FROM settings WHERE id = $1`, ['app_settings']); } catch (e) {}
+	return json({ success: true, wiped: tables }, hdrs);
 }
