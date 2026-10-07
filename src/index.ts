@@ -432,11 +432,10 @@ async function handleSyncPost(request: Request, env: Env, hdrs: Record<string, s
 		// ── Prune rows the client no longer has (deleted in the PWA) ──
 		const deleteOps: Promise<unknown>[] = [];
 		const prune = (table: string, rows: any[] | undefined) => {
-			if (!rows) return;
+			if (!rows || rows.length === 0) return;
 			const ids = rows.map((r) => r.id);
-			if (ids.length > 0) deleteOps.push(query(env, `DELETE FROM ${table} WHERE NOT (id = ANY($1::text[]))`, [ids]));
-			else deleteOps.push(query(env, `DELETE FROM ${table}`));
-		};
+			deleteOps.push(query(env, `DELETE FROM ${table} WHERE NOT (id = ANY($1::text[]))`, [ids]));
+					};
 		prune('inventory', vb.inventory);
 		prune('customers', vb.customers);
 		prune('vehicles', vb.vehicles);
