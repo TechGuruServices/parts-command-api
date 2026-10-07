@@ -771,6 +771,10 @@ async function fetchLiveCatalog(route: RockAutoRoute, url: URL): Promise<Record<
 			const r = await liveCatalog.getEngines(String(p.make), Number(p.year), String(p.model));
 			return { source: 'live-rockauto', ...r };
 		}
+		case 'categories': {
+			const r = await liveCatalog.getCategories(String(p.make), Number(p.year), String(p.model), String(p.carcode));
+			return { source: 'live-rockauto', ...r };
+		}
 		case 'search': {
 			const q = url.searchParams.get('q') || '';
 			const r = await liveCatalog.searchParts(q);
