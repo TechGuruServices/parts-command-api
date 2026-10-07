@@ -39,6 +39,7 @@
  */
 
 import { neon } from '@neondatabase/serverless';
+import * as liveCatalog from './rockauto-catalog';
 
 export interface Env {
 	DATABASE_URL?: string;
@@ -731,12 +732,53 @@ async function handleRockAutoProxy(url: URL, _request: Request, env: Env, hdrs: 
 			}
 			if (attempt < 2) await delay(500 * Math.pow(2, attempt));
 		}
-		console.error('[Proxy] Upstream failed, serving offline catalog fallback:', (lastError as any)?.message);
+		console.error('[Proxy] Upstream failed, trying live catalog:', (lastError as any)?.message);
 	} else {
-		console.warn('[Proxy] PYTHON_SERVICE_URL not set — serving offline catalog fallback');
+		console.warn('[Proxy] PYTHON_SERVICE_URL not set — trying live RockAuto catalog');
+	}
+
+	// Try live RockAuto catalog (direct fetch via rockauto-catalog.ts)
+	try {
+		const liveResult = await fetchLiveCatalog(route, url);
+		if (liveResult) {
+			const liveBody = JSON.stringify(liveResult);
+			if (env.CRM_KV && liveBody.length < 512000) ctx.waitUntil(env.CRM_KV.put(cacheKey, liveBody, { expirationTtl: 3600 }));
+			return new Response(liveBody, { status: 200, headers: { ...hdrs, 'Content-Type': 'application/json', 'X-Cache': 'MISS', 'X-RockAuto-Source': 'live', 'Cache-Control': 'public, s-maxage=3600' } });
+		}
+	} catch (e) {
+		console.warn('[RockAuto] Live fetch failed, using offline fallback:', (e as any)?.message);
 	}
 
 	return buildRockAutoFallback(route, url, hdrs);
+}
+
+async function fetchLiveCatalog(route: RockAutoRoute, url: URL): Promise<Record<string, unknown> | null> {
+	const p = route.params as any;
+	switch (route.kind) {
+		case 'makes': {
+			const r = await liveCatalog.getMakes();
+			return { source: 'live-rockauto', ...r };
+		}
+		case 'years': {
+			const r = await liveCatalog.getYears(String(p.make));
+			return { source: 'live-rockauto', ...r };
+		}
+		case 'models': {
+			const r = await liveCatalog.getModels(String(p.make), Number(p.year));
+			return { source: 'live-rockauto', ...r };
+		}
+		case 'engines': {
+			const r = await liveCatalog.getEngines(String(p.make), Number(p.year), String(p.model));
+			return { source: 'live-rockauto', ...r };
+		}
+		case 'search': {
+			const q = url.searchParams.get('q') || '';
+			const r = await liveCatalog.searchParts(q);
+			return { source: 'live-rockauto', ...r };
+		}
+		default:
+			return null;
+	}
 }
 
 // ── GET /prices (parallel scrapers, KV-cached) ───────────────
