@@ -86,34 +86,45 @@ export async function getEngines(make: string, year: number, model: string): Pro
   const md = model.toLowerCase();
   const html = await raFetch(`${CATALOG_BASE}/${mk},${year},${md}`);
   const engines = new Map<string, string>();
-  // Engine links look like /en/catalog/{make},{year},{model},{carcode},{engine...}
-  const re = new RegExp(`/en/catalog/${mk},${year},${md},([a-zA-Z0-9]+),([^"/]+)`, 'gi');
+  // Engine links: /en/catalog/{make},{year},{model},{engine-name},{carcode}
+  // e.g. /en/catalog/ford,2020,f-150,2.7l+v6+turbocharged,3445533
+  const re = new RegExp(`/en/catalog/${mk},${year},${md},([^",/]+),([0-9]+)`, 'gi');
   let m: RegExpExecArray | null;
   while ((m = re.exec(html)) !== null) {
-    const carcode = m[1];
-    const engine = decodeURIComponent(m[2].replace(/\+/g, ' '));
-    if (!engines.has(carcode)) engines.set(carcode, engine);
+    const engineName = decodeURIComponent(m[1].replace(/\+/g, ' ')).toUpperCase();
+    const carcode = m[2];
+    if (!engines.has(carcode)) engines.set(carcode, engineName);
   }
   const list = [...engines.entries()].map(([carcode, engine]) => ({ carcode, engine }));
   return { make: make.toUpperCase(), year, model: model.toUpperCase(), engines: list, count: list.length };
 }
 
-export async function searchParts(query: string): Promise<{ query: string; results: { partNumber: string; brand: string; description: string }[] }> {
-  // Use RockAuto's part-number search page
-  const html = await raFetch(`https://www.rockauto.com/en/partsearch/?partnum=${encodeURIComponent(query)}`);
-  const results: { partNumber: string; brand: string; description: string }[] = [];
-  // Extract part rows: look for part number patterns in listing tables
-  const rowRe = /<tr[^>]*>[\s\S]*?<\/tr>/gi;
-  let row: RegExpExecArray | null;
-  let count = 0;
-  while ((row = rowRe.exec(html)) !== null && count < 25) {
-    const cell = row[0];
-    const pnMatch = cell.match(/partnum=([A-Z0-9\-]+)/i) || cell.match(/>\s*([A-Z]{2,}\d[\w\-]*)\s*</);
-    if (pnMatch) {
-      const text = cell.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
-      results.push({ partNumber: pnMatch[1], brand: '', description: text });
-      count++;
+export async function getCategories(make: string, year: number, model: string, carcode: string): Promise<{ make: string; year: number; model: string; carcode: string; categories: string[]; count: number }> {
+  const mk = make.toLowerCase();
+  const md = model.toLowerCase();
+  const modelHtml = await raFetch(`${CATALOG_BASE}/${mk},${year},${md}`);
+  const engineRe = new RegExp(`/en/catalog/${mk},${year},${md},([^",/]+),${carcode}`, 'i');
+  const engineMatch = engineRe.exec(modelHtml);
+  const engineSlug = engineMatch ? engineMatch[1] : '';
+  if (!engineSlug) return { make: make.toUpperCase(), year, model: model.toUpperCase(), carcode, categories: [], count: 0 };
+  const html = await raFetch(`${CATALOG_BASE}/${mk},${year},${md},${engineSlug},${carcode}`);
+  const categories = new Set<string>();
+  const catRe = new RegExp(`/en/catalog/${mk},${year},${md},[^",/]+,${carcode},([^"?,/]+)`, 'gi');
+  let m: RegExpExecArray | null;
+  while ((m = catRe.exec(html)) !== null) {
+    const cat = decodeURIComponent(m[1].replace(/\+/g, ' ')).replace(/&amp;/g, '&').trim();
+    if (cat && cat.length > 2 && !cat.includes('mobilemenu') && !cat.includes('language')) {
+      categories.add(cat.toUpperCase());
     }
   }
-  return { query, results };
+  const sorted = [...categories].sort();
+  return { make: make.toUpperCase(), year, model: model.toUpperCase(), carcode, categories: sorted, count: sorted.length };
+}
+
+export async function searchParts(query: string): Promise<{ query: string; results: { partNumber: string; brand: string; description: string }[]; note: string }> {
+  return {
+    query,
+    results: [],
+    note: 'Part search requires JavaScript rendering. Use /prices?partNumber=XXX for specific part lookups, or browse the catalog hierarchy.'
+  };
 }
