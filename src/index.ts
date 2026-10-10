@@ -15,6 +15,7 @@
  *   GET   /sync                  Pull full DB state (ETag/304 support)
  *   POST  /sync                  Push full DB state (upsert + prune deletes)
  *   GET   /prices?partNumber=…   Live competitor price lookup (KV-cached)
+ *   GET   /barcode?code=…        UPC/EAN → product name, brand, part number (KV-cached)
  *   GET   /v1/rockauto/…         RockAuto catalog (proxies PYTHON_SERVICE_URL
  *                                when configured; otherwise serves a built-in
  *                                offline catalog so the UI never 404/503s)
@@ -51,6 +52,7 @@ export interface Env {
 	PYTHON_SERVICE_URL?: string;
 	SERVICE_AUTH_KEY?: string;
 	CRM_KV?: KVNamespace;
+	UPCITEMDB_KEY?: string; // optional paid UPCitemdb key for /barcode
 }
 
 // ── RockAuto upstream route mapping (Python FastAPI service) ──
@@ -151,6 +153,9 @@ export default {
 				if (!user) return json({ error: 'Unauthorized' }, hdrs, 401);
 				if (request.method === 'GET') return handleSyncGet(env, request, hdrs);
 				if (request.method === 'POST') return handleSyncPost(request, env, hdrs, clientIP, user);
+			}
+			if (url.pathname === '/barcode' && request.method === 'GET') {
+				return handleBarcodeLookup(url, env, hdrs, ctx);
 			}
 			if (url.pathname === '/prices' && request.method === 'GET') {
 				return handlePriceLookup(url, env, hdrs, ctx);
@@ -954,4 +959,70 @@ async function handleWipe(env: Env, hdrs: Record<string, string>): Promise<Respo
 	}
 	try { await query(env, `DELETE FROM settings WHERE id = $1`, ['app_settings']); } catch (e) {}
 	return json({ success: true, wiped: tables }, hdrs);
+}
+
+// ── GET /barcode (UPC/EAN → product details, KV-cached) ──────
+// A retail barcode (UPC/EAN) is NOT a manufacturer part number, so it must
+// never be fed to the retailer price scrapers. Resolve it to a product record
+// first; the PWA then prices using the returned part number (when one exists).
+async function handleBarcodeLookup(
+	url: URL,
+	env: Env,
+	hdrs: Record<string, string>,
+	ctx: ExecutionContext,
+): Promise<Response> {
+	const code = (url.searchParams.get('code') || '').replace(/\D/g, '');
+	if (code.length < 8 || code.length > 14) {
+		return json({ error: 'A valid 8-14 digit UPC/EAN barcode is required' }, hdrs, 400);
+	}
+	const cacheKey = `upc:${code}`;
+	if (env.CRM_KV) {
+		const cached = await env.CRM_KV.get(cacheKey, 'json').catch(() => null);
+		if (cached) return json(cached, { ...hdrs, 'X-Cache': 'HIT' });
+	}
+
+	const ctrl = new AbortController();
+	const tid = setTimeout(() => ctrl.abort(), 8000);
+	let out: Record<string, unknown> = { code, found: false, source: 'upcitemdb' };
+	let cacheTtl = 3600; // negative / throttled results: re-check hourly
+	try {
+		const paid = !!env.UPCITEMDB_KEY;
+		const res = await fetch(
+			`https://api.upcitemdb.com/prod/${paid ? 'v1' : 'trial'}/lookup?upc=${encodeURIComponent(code)}`,
+			{
+				headers: paid
+					? { user_key: env.UPCITEMDB_KEY as string, key_type: '3scale', Accept: 'application/json' }
+					: { Accept: 'application/json' },
+				signal: ctrl.signal,
+			},
+		);
+		if (res.status === 429) {
+			out = { ...out, reason: 'lookup_limit_reached' };
+		} else if (res.ok) {
+			const data = (await res.json()) as { items?: Array<Record<string, unknown>> };
+			const item = Array.isArray(data?.items) ? data.items[0] : null;
+			if (item && item.title) {
+				const model = String(item.model || '').trim();
+				out = {
+					code,
+					found: true,
+					source: 'upcitemdb',
+					name: String(item.title).trim().slice(0, 120),
+					brand: String(item.brand || '').trim(),
+					// Only trust "model" as a part number when it is not just the barcode again.
+					partNumber: model && model.replace(/\D/g, '') !== code ? model : '',
+					category: String(item.category || '').trim(),
+				};
+				cacheTtl = 60 * 60 * 24 * 30;
+			}
+		}
+	} catch {
+		out = { ...out, reason: 'lookup_unavailable' };
+	} finally {
+		clearTimeout(tid);
+	}
+	if (env.CRM_KV) {
+		ctx.waitUntil(env.CRM_KV.put(cacheKey, JSON.stringify(out), { expirationTtl: cacheTtl }).catch(() => {}));
+	}
+	return json(out, { ...hdrs, 'X-Cache': 'MISS' });
 }
