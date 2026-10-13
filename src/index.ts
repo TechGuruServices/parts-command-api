@@ -16,7 +16,7 @@
  *   POST  /sync                  Push full DB state (upsert + prune deletes)
  *   GET   /prices?partNumber=…   Live competitor price lookup (KV-cached)
  *   GET   /barcode?code=…        UPC/EAN → product name, brand, part number (KV-cached)
- *   GET   /v1/market-price?partNumber=…  eBay sold-listings average price (KV-cached)
+ *   GET   /v1/market-price?partNumber=…  eBay active-listings average price (KV-cached)
  *   GET   /v1/rockauto/…         RockAuto catalog (proxies PYTHON_SERVICE_URL
  *                                when configured; otherwise serves a built-in
  *                                offline catalog so the UI never 404/503s)
@@ -54,7 +54,8 @@ export interface Env {
 	SERVICE_AUTH_KEY?: string;
 	CRM_KV?: KVNamespace;
 	UPCITEMDB_KEY?: string; // optional paid UPCitemdb key for /barcode
-	EBAY_APP_ID?: string; // eBay Finding API app id for /v1/market-price
+	EBAY_APP_ID?: string; // eBay App ID (Client ID) for /v1/market-price
+	EBAY_CERT_ID?: string; // eBay Cert ID (Client Secret) for /v1/market-price
 }
 
 // ── RockAuto upstream route mapping (Python FastAPI service) ──
@@ -876,7 +877,11 @@ async function handlePriceLookup(url: URL, env: Env, hdrs: Record<string, string
 	return json(prices, { ...hdrs, 'Cache-Control': 'public, s-maxage=3600', 'X-Cache': 'MISS' });
 }
 
-// ── GET /v1/market-price (eBay sold-listings average, KV-cached) ──
+// ── GET /v1/market-price (eBay Browse API active-listings average, KV-cached) ──
+// Uses the CURRENT eBay Browse API (the legacy Finding API was decommissioned
+// by eBay in Feb 2025 and now rejects all calls). OAuth client-credentials
+// flow; the access token is cached in KV. Free tier: 5,000 Browse calls/day.
+// Needs worker secrets EBAY_APP_ID + EBAY_CERT_ID (Production Application Keys).
 async function handleMarketPrice(
 	url: URL,
 	env: Env,
@@ -886,9 +891,12 @@ async function handleMarketPrice(
 	const partNumber = (url.searchParams.get('partNumber') || '').trim();
 	const brand = (url.searchParams.get('brand') || '').trim();
 	if (!partNumber) return json({ error: 'partNumber query param required' }, hdrs, 400);
-	if (!env.EBAY_APP_ID) {
+	if (!env.EBAY_APP_ID || !env.EBAY_CERT_ID) {
 		return json(
-			{ error: 'EBAY_APP_ID not configured', hint: 'run: npx wrangler secret put EBAY_APP_ID' },
+			{
+				error: 'EBAY_APP_ID / EBAY_CERT_ID not configured',
+				hint: 'run: npx wrangler secret put EBAY_APP_ID && npx wrangler secret put EBAY_CERT_ID',
+			},
 			hdrs,
 			500
 		);
@@ -905,59 +913,37 @@ async function handleMarketPrice(
 	}
 
 	const keywords = [brand, partNumber].filter(Boolean).join(' ');
-	const qs = new URLSearchParams({
-		'OPERATION-NAME': 'findCompletedItems',
-		'SERVICE-VERSION': '1.13.0',
-		'SECURITY-APPNAME': env.EBAY_APP_ID,
-		'RESPONSE-DATA-FORMAT': 'JSON',
-		'REST-PAYLOAD': '',
-		keywords,
-		'itemFilter(0).name': 'SoldItemsOnly',
-		'itemFilter(0).value': 'true',
-		'paginationInput.entriesPerPage': '25',
-		'sortOrder': 'EndTimeSoonest',
-	});
-
-	const ctrl = new AbortController();
-	const tid = setTimeout(() => ctrl.abort(), 8000);
-	let ebayRes: Response;
-	try {
-		ebayRes = await fetch(`https://svcs.ebay.com/services/search/FindingService/v1?${qs}`, {
-			signal: ctrl.signal,
-			headers: { 'User-Agent': 'ZempelAuto-CRM/1.0' },
-		});
-	} catch {
-		return json({ partNumber, brand, query: keywords, count: 0, note: 'eBay request timed out' }, hdrs, 502);
-	} finally {
-		clearTimeout(tid);
+	let token = await getEbayToken(env, false);
+	let found = token ? await ebayBrowseSearch(keywords, token) : { items: [], auth: false };
+	if (token && !found.auth) {
+		// Token may have expired between cache read and use — refresh once and retry.
+		token = await getEbayToken(env, true);
+		found = token ? await ebayBrowseSearch(keywords, token) : { items: [], auth: false };
 	}
-	if (!ebayRes.ok) {
-		return json({ partNumber, brand, query: keywords, count: 0, note: `eBay HTTP ${ebayRes.status}` }, hdrs, 502);
+	if (!token || !found.auth) {
+		return json(
+			{
+				partNumber,
+				brand,
+				query: keywords,
+				count: 0,
+				note: 'eBay authentication failed — verify EBAY_APP_ID / EBAY_CERT_ID (Production keys)',
+			},
+			hdrs,
+			502
+		);
 	}
 
-	let payload: any;
-	try {
-		payload = await ebayRes.json();
-	} catch {
-		return json({ partNumber, brand, query: keywords, count: 0, note: 'eBay returned bad JSON' }, hdrs, 502);
-	}
-
-	const resp = payload?.findCompletedItemsResponse?.[0];
-	if (!resp || resp?.ack?.[0] !== 'Success') {
-		const msg =
-			resp?.errorMessage?.[0]?.error?.[0]?.message?.[0] || 'eBay lookup failed';
-		return json({ partNumber, brand, query: keywords, count: 0, note: String(msg).slice(0, 200) }, hdrs, 502);
-	}
-
-	const items: any[] = resp?.searchResult?.[0]?.item ?? [];
 	const prices: number[] = [];
-	for (const it of items) {
-		const raw = it?.sellingStatus?.[0]?.currentPrice?.[0]?.__value__;
+	let currency = 'USD';
+	for (const it of found.items) {
+		const raw = it?.price?.value;
 		const n = typeof raw === 'string' ? parseFloat(raw) : Number(raw);
-		if (Number.isFinite(n) && n > 0) prices.push(n);
+		if (Number.isFinite(n) && n > 0) {
+			prices.push(n);
+			if (it?.price?.currency) currency = it.price.currency;
+		}
 	}
-	const currency: string =
-		items[0]?.sellingStatus?.[0]?.currentPrice?.[0]?.['@currencyId'] || 'USD';
 
 	if (prices.length === 0) {
 		const empty = {
@@ -966,8 +952,8 @@ async function handleMarketPrice(
 			query: keywords,
 			count: 0,
 			currency,
-			source: 'ebay-sold',
-			note: 'No sold eBay listings found for this part number',
+			source: 'ebay-active',
+			note: 'No eBay listings found for this part number',
 			fetchedAt: new Date().toISOString(),
 		};
 		return json(empty, hdrs);
@@ -986,7 +972,7 @@ async function handleMarketPrice(
 		max: round2(prices[prices.length - 1]),
 		count: prices.length,
 		currency,
-		source: 'ebay-sold',
+		source: 'ebay-active',
 		fetchedAt: new Date().toISOString(),
 	};
 
@@ -996,6 +982,78 @@ async function handleMarketPrice(
 		);
 	}
 	return json(result, { ...hdrs, 'Cache-Control': 'public, s-maxage=86400', 'X-Cache': 'MISS' });
+}
+
+// ── eBay OAuth client-credentials token (cached ~2h in KV) ──
+async function getEbayToken(env: Env, forceRefresh: boolean): Promise<string | null> {
+	if (env.CRM_KV && !forceRefresh) {
+		try {
+			const t = await env.CRM_KV.get('ebay:token');
+			if (t) return t;
+		} catch {
+			/* fall through to fresh token */
+		}
+	}
+	const basic =
+		typeof btoa === 'function'
+			? btoa(`${env.EBAY_APP_ID}:${env.EBAY_CERT_ID}`)
+			: Buffer.from(`${env.EBAY_APP_ID}:${env.EBAY_CERT_ID}`).toString('base64');
+	const ctrl = new AbortController();
+	const tid = setTimeout(() => ctrl.abort(), 8000);
+	try {
+		const res = await fetch('https://api.ebay.com/identity/v1/oauth2/token', {
+			method: 'POST',
+			signal: ctrl.signal,
+			headers: {
+				Authorization: 'Basic ' + basic,
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
+			body:
+				'grant_type=client_credentials&scope=' +
+				encodeURIComponent('https://api.ebay.com/oauth/api_scope'),
+		});
+		if (!res.ok) return null;
+		const d: any = await res.json();
+		const tok = d?.access_token;
+		if (typeof tok !== 'string' || !tok) return null;
+		if (env.CRM_KV) {
+			try {
+				await env.CRM_KV.put('ebay:token', tok, { expirationTtl: 7000 });
+			} catch {
+				/* non-fatal */
+			}
+		}
+		return tok;
+	} catch {
+		return null;
+	} finally {
+		clearTimeout(tid);
+	}
+}
+
+// ── eBay Browse API item search (active listings) ──
+async function ebayBrowseSearch(
+	keywords: string,
+	token: string
+): Promise<{ items: any[]; auth: boolean }> {
+	const qs = new URLSearchParams({ q: keywords, limit: '25' });
+	const ctrl = new AbortController();
+	const tid = setTimeout(() => ctrl.abort(), 8000);
+	try {
+		const res = await fetch(
+			'https://api.ebay.com/buy/browse/v1/item_summary/search?' + qs.toString(),
+			{ signal: ctrl.signal, headers: { Authorization: 'Bearer ' + token } }
+		);
+		if (res.status === 401) return { items: [], auth: false };
+		if (!res.ok) return { items: [], auth: true };
+		const d: any = await res.json();
+		const items = d?.itemSummaries;
+		return { items: Array.isArray(items) ? items : [], auth: true };
+	} catch {
+		return { items: [], auth: true };
+	} finally {
+		clearTimeout(tid);
+	}
 }
 
 function round2(n: number): number {
