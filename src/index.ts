@@ -912,7 +912,7 @@ async function handleMarketPrice(
 		}
 	}
 
-	const keywords = [brand, partNumber].filter(Boolean).join(' ');
+	const keywords = [brand, `"${partNumber}"`].filter(Boolean).join(' ');
 	let token = await getEbayToken(env, false);
 	let found = token ? await ebayBrowseSearch(keywords, token) : { items: [], auth: false };
 	if (token && !found.auth) {
