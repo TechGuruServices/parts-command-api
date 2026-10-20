@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * PartsCommand CRM API — Cloudflare Worker v3.2.0
+ * PartsCommand CRM API — Cloudflare Worker v3.3.0
  * ============================================================
  * CANONICAL API worker for the Zempel Auto / PartsCommand CRM
  * (https://zempel-auto-crm.pages.dev). This file mirrors
@@ -12,6 +12,11 @@
  *   GET   /health                Health check
  *   POST  /auth/login            Login (HS256 JWT via Web Crypto — no deps)
  *   POST  /auth/logout           Session revoke
+ *   POST  /auth/change-password  Change own password (auth required)
+ *   GET   /admin/users           List users, no hashes (admin)
+ *   POST  /admin/users           Create/update user (admin)
+ *   DELETE /admin/users?email=…  Delete user (admin)
+ *   POST  /admin/wipe            Wipe all data tables (admin)
  *   GET   /sync                  Pull full DB state (ETag/304 support)
  *   POST  /sync                  Push full DB state (upsert + prune deletes)
  *   GET   /prices?partNumber=…   Live competitor price lookup (KV-cached)
@@ -139,21 +144,25 @@ export default {
 
 			// ── Public routes ──
 			if (url.pathname === '/' || url.pathname === '/index.html' || url.pathname === '') {
-				return json({ message: 'PartsCommand CRM API', status: 'online', version: '3.2.0' }, hdrs);
+				return json({ message: 'PartsCommand CRM API', status: 'online', version: '3.3.0' }, hdrs);
 			}
 			if (url.pathname === '/favicon.ico') return new Response(null, { status: 204, headers: hdrs });
 			if (url.pathname === '/health') return json({ status: 'ok', ts: new Date().toISOString() }, hdrs);
 			if (url.pathname === '/auth/login' && request.method === 'POST') return handleLogin(request, env, hdrs);
 			if (url.pathname === '/auth/logout' && request.method === 'POST') return handleLogout(request, env, hdrs);
+			if (url.pathname === '/auth/change-password' && request.method === 'POST') return handleChangePassword(request, env, hdrs);
 
-			// ── App routes (origin-restricted via ALLOWED_ORIGIN; the PWA has no
-			// login screen and never sends Authorization headers) ──
+			// ── App routes (origin-restricted via ALLOWED_ORIGIN; the PWA's
+			// auth.js attaches the JWT to every API call) ──
 			if (url.pathname.startsWith('/v1/rockauto/')) {
 				return handleRockAutoProxy(url, request, env, hdrs, ctx, clientIP);
 			}
 			if (url.pathname === '/sync') {
 				const user = await requireAuth(request, env);
 				if (!user) return json({ error: 'Unauthorized' }, hdrs, 401);
+				if (request.method === 'POST' && isReadOnlyRole(user)) {
+					return json({ error: 'Read-only account: this role cannot modify data' }, hdrs, 403);
+				}
 				if (request.method === 'GET') return handleSyncGet(env, request, hdrs);
 				if (request.method === 'POST') return handleSyncPost(request, env, hdrs, clientIP, user);
 			}
@@ -166,6 +175,14 @@ export default {
 			if (url.pathname === '/prices' && request.method === 'GET') {
 				return handlePriceLookup(url, env, hdrs, ctx);
 	}
+			if (url.pathname === '/admin/users') {
+				const user = await requireAuth(request, env);
+				if (!user || user.role !== 'admin') return json({ error: 'Admin required' }, hdrs, 403);
+				if (request.method === 'GET') return handleListUsers(env, hdrs);
+				if (request.method === 'POST') return handleUpsertUser(request, env, hdrs);
+				if (request.method === 'DELETE') return handleDeleteUser(request, env, hdrs, user);
+				return json({ error: 'Method not allowed' }, hdrs, 405);
+			}
 	if (url.pathname === '/admin/wipe' && request.method === 'POST') {
 		const user = await requireAuth(request, env);
 		if (!user || user.role !== 'admin') return json({ error: 'Admin required' }, hdrs, 403);
@@ -207,6 +224,90 @@ async function sha(algo: 'SHA-1' | 'SHA-256', data: string): Promise<string> {
 		.join('');
 }
 
+// ── Password hashing ─────────────────────────────────────────
+// New hashes: PBKDF2-HMAC-SHA256, 100k iterations, random 16-byte salt,
+// stored as "pbkdf2$<iterations>$<salt b64>$<hash b64>". Legacy records
+// hold an unsalted SHA-256 hex of the password; verifyPassword accepts
+// both and flags legacy hits so login can upgrade the stored hash.
+const PBKDF2_ITERATIONS = 100000;
+
+function bytesToB64(bytes: Uint8Array): string {
+	let bin = '';
+	bytes.forEach((b) => (bin += String.fromCharCode(b)));
+	return btoa(bin);
+}
+
+function b64ToBytes(b64: string): Uint8Array {
+	const bin = atob(b64);
+	const bytes = new Uint8Array(bin.length);
+	for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+	return bytes;
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+	if (a.length !== b.length) return false;
+	let diff = 0;
+	for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+	return diff === 0;
+}
+
+async function pbkdf2Hash(password: string): Promise<string> {
+	const salt = crypto.getRandomValues(new Uint8Array(16));
+	const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+	const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: salt as BufferSource, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' }, key, 256);
+	return `pbkdf2$${PBKDF2_ITERATIONS}$${bytesToB64(salt)}$${bytesToB64(new Uint8Array(bits))}`;
+}
+
+async function verifyPassword(password: string, stored: unknown): Promise<{ ok: boolean; legacy: boolean }> {
+	if (typeof stored !== 'string' || !stored) return { ok: false, legacy: false };
+	if (stored.startsWith('pbkdf2$')) {
+		try {
+			const parts = stored.split('$');
+			const iterations = parseInt(parts[1], 10) || PBKDF2_ITERATIONS;
+			const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+			const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: b64ToBytes(parts[2]) as BufferSource, iterations, hash: 'SHA-256' }, key, 256);
+			return { ok: timingSafeEqual(bytesToB64(new Uint8Array(bits)), parts[3]), legacy: false };
+		} catch {
+			return { ok: false, legacy: false };
+		}
+	}
+	const legacyHash = await sha('SHA-256', password);
+	return { ok: timingSafeEqual(legacyHash, stored), legacy: true };
+}
+
+// ── Sessions ─────────────────────────────────────────────────
+// Login appends the issued token to a per-user list in KV
+// (session:<userId>, JSON array, newest last, max 5). requireAuth only
+// accepts tokens on that list, so logout actually revokes access
+// instead of leaving the token valid until expiry. Values written by
+// older versions (a bare token string) read as a one-element list so
+// live sessions survive the upgrade.
+async function getSessions(env: Env, userId: string): Promise<string[]> {
+	if (!env.CRM_KV) return [];
+	const raw = await env.CRM_KV.get(`session:${userId}`);
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw);
+		if (Array.isArray(parsed)) return parsed.filter((t) => typeof t === 'string');
+	} catch { /* legacy bare-token format */ }
+	return [raw];
+}
+
+async function saveSessions(env: Env, userId: string, tokens: string[]): Promise<void> {
+	if (!env.CRM_KV) return;
+	if (!tokens.length) {
+		await env.CRM_KV.delete(`session:${userId}`);
+		return;
+	}
+	await env.CRM_KV.put(`session:${userId}`, JSON.stringify(tokens.slice(-5)), { expirationTtl: 86400 });
+}
+
+// Roles: 'guest' (and any token without a role) is read-only — it may
+// pull state but can never push changes. 'user' and 'admin' may write.
+function isReadOnlyRole(user: Record<string, unknown> | null): boolean {
+	return !user || typeof user.role !== 'string' || user.role === 'guest';
+}
+
 // ── Minimal HS256 JWT (Web Crypto — replaces the jsonwebtoken dep) ──
 function b64url(input: ArrayBuffer | string): string {
 	const bytes = typeof input === 'string' ? new TextEncoder().encode(input) : new Uint8Array(input);
@@ -244,7 +345,14 @@ async function requireAuth(request: Request, env: Env): Promise<Record<string, u
 	if (!env.JWT_SECRET) return null;
 	const authH = request.headers.get('Authorization');
 	if (!authH) return null;
-	return jwtVerify(authH.replace(/^Bearer\s+/i, ''), env.JWT_SECRET);
+	const token = authH.replace(/^Bearer\s+/i, '');
+	const payload = await jwtVerify(token, env.JWT_SECRET);
+	if (!payload) return null;
+	if (env.CRM_KV && payload.id) {
+		const sessions = await getSessions(env, String(payload.id));
+		if (!sessions.includes(token)) return null;
+	}
+	return payload;
 }
 // ── Auth ─────────────────────────────────────────────────────
 async function handleLogin(request: Request, env: Env, hdrs: Record<string, string>): Promise<Response> {
@@ -262,26 +370,154 @@ async function handleLogin(request: Request, env: Env, hdrs: Record<string, stri
 	let userRecord: { id: string; email: string; role: string } | null = null;
 
 	if (env.CRM_KV) {
-		const stored = await env.CRM_KV.get(`user:${body.email}`, 'json');
-		if (stored && (stored as any).passwordHash === pwHash) userRecord = stored as any;
+		const stored = (await env.CRM_KV.get(`user:${body.email}`, 'json')) as any;
+		if (stored) {
+			const verdict = await verifyPassword(body.password, stored.passwordHash);
+			if (verdict.ok) {
+				userRecord = stored;
+				if (verdict.legacy) {
+					// Upgrade the stored hash to PBKDF2 on first successful login.
+					stored.passwordHash = await pbkdf2Hash(body.password);
+					await env.CRM_KV.put(`user:${body.email}`, JSON.stringify(stored));
+				}
+			}
+		}
 	}
 	if (!userRecord && body.email === adminEmail && env.ADMIN_PASSWORD_HASH && pwHash === env.ADMIN_PASSWORD_HASH) {
 		userRecord = { id: 'admin-001', email: adminEmail, role: 'admin' };
-		if (env.CRM_KV) await env.CRM_KV.put(`user:${body.email}`, JSON.stringify({ ...userRecord, passwordHash: pwHash }));
+		if (env.CRM_KV) await env.CRM_KV.put(`user:${body.email}`, JSON.stringify({ ...userRecord, passwordHash: await pbkdf2Hash(body.password) }));
 	}
 	if (!userRecord) return json({ error: 'Invalid email or password' }, hdrs, 401);
 	if (!env.JWT_SECRET) return json({ error: 'JWT_SECRET not configured' }, hdrs, 500);
 
 	const token = await jwtSign({ id: userRecord.id, email: userRecord.email, role: userRecord.role }, env.JWT_SECRET);
-	if (env.CRM_KV) await env.CRM_KV.put(`session:${userRecord.id}`, token, { expirationTtl: 86400 });
+	if (env.CRM_KV) {
+		const sessions = await getSessions(env, userRecord.id);
+		sessions.push(token);
+		await saveSessions(env, userRecord.id, sessions);
+	}
 	return json({ token, user: { id: userRecord.id, email: userRecord.email, role: userRecord.role } }, hdrs);
 }
 
 async function handleLogout(request: Request, env: Env, hdrs: Record<string, string>): Promise<Response> {
 	const authH = request.headers.get('Authorization');
 	if (!authH || !env.JWT_SECRET) return json({ success: true }, hdrs);
-	const user = await jwtVerify(authH.replace(/^Bearer\s+/i, ''), env.JWT_SECRET);
-	if (user && env.CRM_KV) await env.CRM_KV.delete(`session:${user.id}`);
+	const token = authH.replace(/^Bearer\s+/i, '');
+	const user = await jwtVerify(token, env.JWT_SECRET);
+	if (user && env.CRM_KV) {
+		const sessions = await getSessions(env, String(user.id));
+		await saveSessions(env, String(user.id), sessions.filter((t) => t !== token));
+	}
+	return json({ success: true }, hdrs);
+}
+
+// ── POST /auth/change-password ───────────────────────────────
+// Any signed-in user changes their OWN password. Verifies the current
+// password against the KV record (PBKDF2 or legacy), falling back to the
+// ADMIN_PASSWORD_HASH bootstrap for the admin account if its KV record
+// is missing. The new password is always stored as PBKDF2.
+async function handleChangePassword(request: Request, env: Env, hdrs: Record<string, string>): Promise<Response> {
+	const user = await requireAuth(request, env);
+	if (!user) return json({ error: 'Unauthorized' }, hdrs, 401);
+	let body: any;
+	try {
+		body = await request.json();
+	} catch {
+		return json({ error: 'Invalid JSON' }, hdrs, 400);
+	}
+	const currentPassword = body?.currentPassword;
+	const newPassword = body?.newPassword;
+	if (typeof currentPassword !== 'string' || typeof newPassword !== 'string' || !currentPassword || !newPassword) {
+		return json({ error: 'Both current and new passwords are required' }, hdrs, 400);
+	}
+	if (newPassword.length < 8) return json({ error: 'New password must be at least 8 characters' }, hdrs, 400);
+	if (newPassword === currentPassword) return json({ error: 'New password must be different from the current password' }, hdrs, 400);
+	if (!env.CRM_KV) return json({ error: 'User store unavailable' }, hdrs, 500);
+
+	const email = String(user.email || '');
+	const stored = (await env.CRM_KV.get(`user:${email}`, 'json')) as any;
+	let record: any = stored || null;
+	let verified = false;
+	if (stored) {
+		const verdict = await verifyPassword(currentPassword, stored.passwordHash);
+		verified = verdict.ok;
+	}
+	if (!verified) {
+		const adminEmail = env.ADMIN_EMAIL || 'admin@zempelauto.com';
+		const legacyHash = await sha('SHA-256', currentPassword);
+		if (email === adminEmail && env.ADMIN_PASSWORD_HASH && legacyHash === env.ADMIN_PASSWORD_HASH) {
+			verified = true;
+			record = record || { id: String(user.id || 'admin-001'), email, role: 'admin' };
+		}
+	}
+	if (!verified || !record) return json({ error: 'Current password is incorrect' }, hdrs, 401);
+
+	record.passwordHash = await pbkdf2Hash(newPassword);
+	await env.CRM_KV.put(`user:${email}`, JSON.stringify(record));
+	return json({ success: true }, hdrs);
+}
+
+// ── Admin: user management (records live in CRM_KV as user:<email>) ──
+async function handleListUsers(env: Env, hdrs: Record<string, string>): Promise<Response> {
+	if (!env.CRM_KV) return json({ error: 'User store unavailable' }, hdrs, 500);
+	const users: { id: string; email: string; role: string }[] = [];
+	let cursor: string | undefined;
+	do {
+		const page: any = await env.CRM_KV.list({ prefix: 'user:', cursor, limit: 1000 });
+		for (const key of page.keys) {
+			const rec = (await env.CRM_KV.get(key.name, 'json')) as any;
+			if (rec) users.push({ id: rec.id, email: rec.email, role: rec.role });
+		}
+		cursor = page.list_complete ? undefined : page.cursor;
+	} while (cursor);
+	users.sort((a, b) => String(a.email).localeCompare(String(b.email)));
+	return json({ users }, hdrs);
+}
+
+async function handleUpsertUser(request: Request, env: Env, hdrs: Record<string, string>): Promise<Response> {
+	if (!env.CRM_KV) return json({ error: 'User store unavailable' }, hdrs, 500);
+	let body: any;
+	try {
+		body = await request.json();
+	} catch {
+		return json({ error: 'Invalid JSON' }, hdrs, 400);
+	}
+	const email = typeof body?.email === 'string' ? body.email.trim() : '';
+	if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return json({ error: 'A valid email is required' }, hdrs, 400);
+	const role = body?.role;
+	if (role !== 'admin' && role !== 'user' && role !== 'guest') {
+		return json({ error: 'Role must be admin, user, or guest' }, hdrs, 400);
+	}
+	const hasPassword = typeof body?.password === 'string' && body.password.length > 0;
+	if (hasPassword && (body.password as string).length < 8) {
+		return json({ error: 'Password must be at least 8 characters' }, hdrs, 400);
+	}
+	const existing = (await env.CRM_KV.get(`user:${email}`, 'json')) as any;
+	if (!existing && !hasPassword) return json({ error: 'A password is required for a new user' }, hdrs, 400);
+	const record: any = existing || {
+		id: 'usr-' + Array.from(crypto.getRandomValues(new Uint8Array(6))).map((b) => b.toString(16).padStart(2, '0')).join(''),
+		email,
+		role,
+		passwordHash: '',
+	};
+	record.email = email;
+	record.role = role;
+	if (hasPassword) record.passwordHash = await pbkdf2Hash(body.password as string);
+	await env.CRM_KV.put(`user:${email}`, JSON.stringify(record));
+	return json({ success: true, user: { id: record.id, email: record.email, role: record.role } }, hdrs);
+}
+
+async function handleDeleteUser(request: Request, env: Env, hdrs: Record<string, string>, currentUser: Record<string, unknown>): Promise<Response> {
+	if (!env.CRM_KV) return json({ error: 'User store unavailable' }, hdrs, 500);
+	const url = new URL(request.url);
+	const email = (url.searchParams.get('email') || '').trim();
+	if (!email) return json({ error: 'Email query parameter is required' }, hdrs, 400);
+	if (email === String(currentUser.email || '')) {
+		return json({ error: 'You cannot delete your own account' }, hdrs, 400);
+	}
+	const rec = (await env.CRM_KV.get(`user:${email}`, 'json')) as any;
+	await env.CRM_KV.delete(`user:${email}`);
+	if (rec?.id) await env.CRM_KV.delete(`session:${rec.id}`);
 	return json({ success: true }, hdrs);
 }
 
