@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * PartsCommand CRM API — Cloudflare Worker v3.3.1
+ * PartsCommand CRM API — Cloudflare Worker v3.3.2
  * ============================================================
  * CANONICAL API worker for the Zempel Auto / PartsCommand CRM
  * (https://zempel-auto-crm.pages.dev). This file mirrors
@@ -131,7 +131,7 @@ export default {
 
 		try {
 			// ── Rate limiting (5 req/s per IP via KV, public routes) ──
-			// v3.3.1: KV is on the free tier (1,000 writes/day) and the old
+			// v3.3.2: KV is on the free tier (1,000 writes/day) and the old
 			// code wrote a counter on EVERY request — a busy day exhausted
 			// the quota and login (which must write the session to KV)
 			// went down with it. Authenticated app routes now skip the
@@ -153,7 +153,7 @@ export default {
 
 			// ── Public routes ──
 			if (url.pathname === '/' || url.pathname === '/index.html' || url.pathname === '') {
-				return json({ message: 'PartsCommand CRM API', status: 'online', version: '3.3.1' }, hdrs);
+				return json({ message: 'PartsCommand CRM API', status: 'online', version: '3.3.2' }, hdrs);
 			}
 			if (url.pathname === '/favicon.ico') return new Response(null, { status: 204, headers: hdrs });
 			if (url.pathname === '/health') return json({ status: 'ok', ts: new Date().toISOString() }, hdrs);
@@ -1382,10 +1382,20 @@ async function scrapeRetailer(retailer: string, searchUrl: string, parser: (html
 
 function parseNapa(html: string) {
 	const nameMatch = html.match(/"name"\s*:\s*"([^"]+)"/);
-	const jsonLdMatch = html.match(/"price"\s*:\s*"?([\d.]+)"?/);
-	const priceMatch = html.match(/\$\s*([\d,]+\.[\d]{2})/);
-	const price = jsonLdMatch ? parseFloat(jsonLdMatch[1]) : priceMatch ? parseFloat(priceMatch[1].replace(',', '')) : null;
-	return { price: price !== null && isNaN(price) ? null : price, name: nameMatch ? nameMatch[1] : null };
+	// v3.3.2: structured prices ONLY (the standard the other retailer
+	// parsers already use). The old first-match regexes — the first
+	// "price": X in the page or the first $X.XX anywhere in the HTML —
+	// reliably harvested a bogus $2 from NAPA search-page furniture and
+	// that value was then persisted as the part's NAPA price, where the
+	// Add Part flow turned it into a fabricated $2.00 cost / $2.60 sell
+	// price. No structured price on the page = no price (null), which
+	// the UI already handles honestly ("enter prices manually").
+	const sale = html.match(/"salePrice"\s*:\s*"?([\d.]+)"?/);
+	const fin = html.match(/"finalPrice"\s*:\s*"?([\d.]+)"?/);
+	const ld = html.match(/"@type"\s*:\s*"Product"[\s\S]{0,4000}?"price"\s*:\s*"?([\d.]+)"?/);
+	const raw = sale ? parseFloat(sale[1]) : fin ? parseFloat(fin[1]) : ld ? parseFloat(ld[1]) : null;
+	const price = raw !== null && !isNaN(raw) && raw > 0 ? raw : null;
+	return { price, name: nameMatch ? nameMatch[1] : null };
 }
 
 function parseAutozone(html: string) {
