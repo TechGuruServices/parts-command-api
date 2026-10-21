@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * PartsCommand CRM API — Cloudflare Worker v3.3.0
+ * PartsCommand CRM API — Cloudflare Worker v3.3.1
  * ============================================================
  * CANONICAL API worker for the Zempel Auto / PartsCommand CRM
  * (https://zempel-auto-crm.pages.dev). This file mirrors
@@ -130,21 +130,30 @@ export default {
 		if (!isOriginAllowed) return json({ error: 'Forbidden origin' }, hdrs, 403);
 
 		try {
-			// ── Rate limiting (5 req/s per IP via KV) ──
-			if (env.CRM_KV) {
-				const rlKey = `rl:${clientIP}:${Math.floor(Date.now() / 1000)}`;
+			// ── Rate limiting (5 req/s per IP via KV, public routes) ──
+			// v3.3.1: KV is on the free tier (1,000 writes/day) and the old
+			// code wrote a counter on EVERY request — a busy day exhausted
+			// the quota and login (which must write the session to KV)
+			// went down with it. Authenticated app routes now skip the
+			// counter entirely (a valid JWT is the gate there), /auth/login
+			// keeps a cheap per-minute bucket (30/min/IP; logins are rare),
+			// and public routes keep the per-second limiter. The window is
+			// encoded in the key itself; the 60s TTL (KV's minimum) simply
+			// lets stale window keys expire on their own.
+			const rlPath = url.pathname;
+			const rlSkip = rlPath === '/sync' || rlPath === '/auth/logout' || rlPath === '/auth/change-password' || rlPath.startsWith('/admin/');
+			if (env.CRM_KV && !rlSkip) {
+				const rlIsLogin = rlPath === '/auth/login';
+				const rlWindow = rlIsLogin ? Math.floor(Date.now() / 60000) : Math.floor(Date.now() / 1000);
+				const rlKey = `rl:${clientIP}:${rlWindow}`;
 				const cur = parseInt((await env.CRM_KV.get(rlKey)) || '0');
-				if (cur >= 5) return json({ error: 'Rate limit exceeded' }, hdrs, 429);
-				// FIX: KV rejects expirationTtl < 60 ("Expiration TTL must be at least 60"),
-				// so the old ttl:2 put failed on EVERY request and rate limiting never
-				// actually counted anything. The per-second window is encoded in the key
-				// itself; a 60s TTL simply lets stale window keys expire on their own.
+				if (cur >= (rlIsLogin ? 30 : 5)) return json({ error: 'Rate limit exceeded' }, hdrs, 429);
 				ctx.waitUntil(env.CRM_KV.put(rlKey, String(cur + 1), { expirationTtl: 60 }).catch(() => {}));
 			}
 
 			// ── Public routes ──
 			if (url.pathname === '/' || url.pathname === '/index.html' || url.pathname === '') {
-				return json({ message: 'PartsCommand CRM API', status: 'online', version: '3.3.0' }, hdrs);
+				return json({ message: 'PartsCommand CRM API', status: 'online', version: '3.3.1' }, hdrs);
 			}
 			if (url.pathname === '/favicon.ico') return new Response(null, { status: 204, headers: hdrs });
 			if (url.pathname === '/health') return json({ status: 'ok', ts: new Date().toISOString() }, hdrs);
@@ -349,8 +358,14 @@ async function requireAuth(request: Request, env: Env): Promise<Record<string, u
 	const payload = await jwtVerify(token, env.JWT_SECRET);
 	if (!payload) return null;
 	if (env.CRM_KV && payload.id) {
-		const sessions = await getSessions(env, String(payload.id));
-		if (!sessions.includes(token)) return null;
+		try {
+			const sessions = await getSessions(env, String(payload.id));
+			if (!sessions.includes(token)) return null;
+		} catch (e) {
+			// KV read outage: fall back to signature-only verification
+			// rather than locking every signed-in user out.
+			console.warn('[Auth] session check failed, signature-only fallback:', e);
+		}
 	}
 	return payload;
 }
@@ -377,24 +392,41 @@ async function handleLogin(request: Request, env: Env, hdrs: Record<string, stri
 				userRecord = stored;
 				if (verdict.legacy) {
 					// Upgrade the stored hash to PBKDF2 on first successful login.
-					stored.passwordHash = await pbkdf2Hash(body.password);
-					await env.CRM_KV.put(`user:${body.email}`, JSON.stringify(stored));
+					// Non-fatal if the KV write fails (e.g. free-tier write
+					// quota): the legacy hash still verifies on the next login.
+					try {
+						stored.passwordHash = await pbkdf2Hash(body.password);
+						await env.CRM_KV.put(`user:${body.email}`, JSON.stringify(stored));
+					} catch (e) { console.warn('[Auth] hash upgrade write failed:', e); }
 				}
 			}
 		}
 	}
 	if (!userRecord && body.email === adminEmail && env.ADMIN_PASSWORD_HASH && pwHash === env.ADMIN_PASSWORD_HASH) {
 		userRecord = { id: 'admin-001', email: adminEmail, role: 'admin' };
-		if (env.CRM_KV) await env.CRM_KV.put(`user:${body.email}`, JSON.stringify({ ...userRecord, passwordHash: await pbkdf2Hash(body.password) }));
+		if (env.CRM_KV) {
+			try {
+				await env.CRM_KV.put(`user:${body.email}`, JSON.stringify({ ...userRecord, passwordHash: await pbkdf2Hash(body.password) }));
+			} catch (e) { console.warn('[Auth] bootstrap persist failed:', e); }
+		}
 	}
 	if (!userRecord) return json({ error: 'Invalid email or password' }, hdrs, 401);
 	if (!env.JWT_SECRET) return json({ error: 'JWT_SECRET not configured' }, hdrs, 500);
 
 	const token = await jwtSign({ id: userRecord.id, email: userRecord.email, role: userRecord.role }, env.JWT_SECRET);
 	if (env.CRM_KV) {
-		const sessions = await getSessions(env, userRecord.id);
-		sessions.push(token);
-		await saveSessions(env, userRecord.id, sessions);
+		try {
+			const sessions = await getSessions(env, userRecord.id);
+			sessions.push(token);
+			await saveSessions(env, userRecord.id, sessions);
+		} catch (e) {
+			// Without the session record this token would be rejected by
+			// requireAuth on the very next request, so fail the login
+			// honestly instead of issuing a doomed token (e.g. when the
+			// KV free-tier write quota is exhausted).
+			console.error('[Auth] session save failed:', e);
+			return json({ error: 'Sign-in is temporarily unavailable. Please try again in a few minutes.' }, hdrs, 503);
+		}
 	}
 	return json({ token, user: { id: userRecord.id, email: userRecord.email, role: userRecord.role } }, hdrs);
 }
@@ -453,7 +485,12 @@ async function handleChangePassword(request: Request, env: Env, hdrs: Record<str
 	if (!verified || !record) return json({ error: 'Current password is incorrect' }, hdrs, 401);
 
 	record.passwordHash = await pbkdf2Hash(newPassword);
-	await env.CRM_KV.put(`user:${email}`, JSON.stringify(record));
+	try {
+		await env.CRM_KV.put(`user:${email}`, JSON.stringify(record));
+	} catch (e) {
+		console.error('[Auth] change-password write failed:', e);
+		return json({ error: 'Your new password could not be saved right now. Please try again in a few minutes.' }, hdrs, 503);
+	}
 	return json({ success: true }, hdrs);
 }
 
@@ -503,7 +540,12 @@ async function handleUpsertUser(request: Request, env: Env, hdrs: Record<string,
 	record.email = email;
 	record.role = role;
 	if (hasPassword) record.passwordHash = await pbkdf2Hash(body.password as string);
-	await env.CRM_KV.put(`user:${email}`, JSON.stringify(record));
+	try {
+		await env.CRM_KV.put(`user:${email}`, JSON.stringify(record));
+	} catch (e) {
+		console.error('[Admin] user write failed:', e);
+		return json({ error: 'The user could not be saved right now. Please try again in a few minutes.' }, hdrs, 503);
+	}
 	return json({ success: true, user: { id: record.id, email: record.email, role: record.role } }, hdrs);
 }
 
@@ -516,8 +558,13 @@ async function handleDeleteUser(request: Request, env: Env, hdrs: Record<string,
 		return json({ error: 'You cannot delete your own account' }, hdrs, 400);
 	}
 	const rec = (await env.CRM_KV.get(`user:${email}`, 'json')) as any;
-	await env.CRM_KV.delete(`user:${email}`);
-	if (rec?.id) await env.CRM_KV.delete(`session:${rec.id}`);
+	try {
+		await env.CRM_KV.delete(`user:${email}`);
+		if (rec?.id) await env.CRM_KV.delete(`session:${rec.id}`);
+	} catch (e) {
+		console.error('[Admin] user delete failed:', e);
+		return json({ error: 'The user could not be deleted right now. Please try again in a few minutes.' }, hdrs, 503);
+	}
 	return json({ success: true }, hdrs);
 }
 
